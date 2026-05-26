@@ -1,0 +1,39 @@
+# ---- Data & checkpoints (never track) ----
+ckpt/
+data/
+dataset/
+distill/
+models/
+runs/
+result/
+.baseline_slots/
+
+# ---- Platform / identity / internal files ----
+inference_job/
+infer-ft-job/
+platform_job/
+SESSION_NOTES*.md
+README_zh.md
+
+# ---- Temporary files ----
+tmp_*.log
+wait_and_package_gar.sh
+__pycache__/
+*.pyc
+
+# ---- slime framework (separate project, only GAR plugin is ours) ----
+slime/
+
+# ---- Paper source & figures (not for open-source) ----
+pdf/
+
+# ---- Eval: only keep strict_tags final versions ----
+eval/raw_hf/
+eval/eval_manifest.json
+eval/*_queries.jsonl
+
+# ---- Misc ----
+*.swp
+*.swo
+*~
+.DS_Store

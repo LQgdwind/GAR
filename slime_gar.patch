@@ -1,0 +1,1217 @@
+diff --git a/slime/backends/megatron_utils/actor.py b/slime/backends/megatron_utils/actor.py
+index 9abb2f96..83f13200 100644
+--- a/slime/backends/megatron_utils/actor.py
++++ b/slime/backends/megatron_utils/actor.py
+@@ -19,7 +19,7 @@ from slime.utils.data import process_rollout_data
+ from slime.utils.distributed_utils import get_gloo_group, init_process_group
+ from slime.utils.logging_utils import init_tracking
+ from slime.utils.memory_utils import clear_memory, print_memory
+-from slime.utils.misc import Box
++from slime.utils.misc import Box, load_function
+ from slime.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
+ from slime.utils.routing_replay import RoutingReplay
+ from slime.utils.timer import Timer, inverse_timer, timer, with_defer
+@@ -149,10 +149,12 @@ class MegatronTrainRayActor(TrainRayActor):
+ 
+         self.rollout_data_postprocess = None
+         if self.args.rollout_data_postprocess_path is not None:
+-            from slime.utils.misc import load_function
+-
+             self.rollout_data_postprocess = load_function(self.args.rollout_data_postprocess_path)
+ 
++        self.custom_online_reward_func = None
++        if self.args.custom_online_reward_path is not None:
++            self.custom_online_reward_func = load_function(self.args.custom_online_reward_path)
++
+         self.prof.on_init_end()
+ 
+         return start_rollout_id
+@@ -452,6 +454,14 @@ class MegatronTrainRayActor(TrainRayActor):
+                 if self._active_model_tag != "actor":
+                     self._switch_model("actor")
+ 
++                if self.custom_online_reward_func is not None:
++                    self.custom_online_reward_func(
++                        self.args,
++                        self.model,
++                        rollout_data,
++                        self.tokenizer,
++                    )
++
+                 # Calculate adv and returns. Need to performed before training (instead of on the fly),
+                 # because we may need normalize the whole rollout.
+                 compute_advantages_and_returns(self.args, rollout_data)
+diff --git a/slime/backends/megatron_utils/data.py b/slime/backends/megatron_utils/data.py
+index 36ef3dae..f54d161e 100644
+--- a/slime/backends/megatron_utils/data.py
++++ b/slime/backends/megatron_utils/data.py
+@@ -399,7 +399,8 @@ def log_rollout_data(
+     - Tensor-valued lists are concatenated and averaged. For token-level metrics
+       like log-probs/returns/advantages/values, computes a CP-correct sample mean
+       using `loss_masks` and total/response lengths.
+-    - Non-tensor lists are averaged elementwise.
++    - Non-tensor numeric lists are averaged elementwise.
++    - Structured metadata and other non-numeric values are skipped.
+     - Scalars are converted to Python numbers.
+     """
+     if mpu.get_tensor_model_parallel_rank() == 0 and mpu.is_pipeline_last_stage():
+@@ -416,6 +417,7 @@ def log_rollout_data(
+                 "multimodal_train_inputs",
+                 "loss_masks",
+                 "sample_indices",
++                "metadata",
+                 "rollout_routed_experts",
+                 "max_seq_lens",
+                 "dynamic_global_batch_size",
+@@ -425,6 +427,8 @@ def log_rollout_data(
+             # There are the following assumptions:
+             # - Each dp rank has the same number of samples
+             if isinstance(val, (list, tuple)):
++                if len(val) == 0:
++                    continue
+                 if isinstance(val[0], torch.Tensor):
+                     # NOTE: Here we have to do the clone().detach(), otherwise the tensor will be
+                     # modified in place and will cause problem for the next rollout.
+@@ -450,12 +454,18 @@ def log_rollout_data(
+                     else:
+                         val = torch.cat(val).clone().detach()
+                         val = val.mean() * cp_size
+-                else:
++                elif isinstance(val[0], (int, float, bool, np.number)):
+                     val = sum(val) / len(val)
++                else:
++                    logger.debug("Skip non-numeric rollout log key %s with element type %s", key, type(val[0]).__name__)
++                    continue
+             elif isinstance(val, torch.Tensor):
+                 val = val.float().mean()
++            elif isinstance(val, (int, float, bool, np.number)):
++                val = float(val)
+             else:
+-                raise ValueError(f"Unsupported type: {type(val)} for key: {key}")
++                logger.debug("Skip non-scalar rollout log key %s with type %s", key, type(val).__name__)
++                continue
+             log_dict[key] = val.item() if isinstance(val, torch.Tensor) else val
+ 
+         reduced_log_dict = gather_log_data("rollout", args, rollout_id, log_dict)
+diff --git a/slime/backends/megatron_utils/loss.py b/slime/backends/megatron_utils/loss.py
+index e84de361..0e4b79be 100644
+--- a/slime/backends/megatron_utils/loss.py
++++ b/slime/backends/megatron_utils/loss.py
+@@ -73,8 +73,10 @@ def get_responses(
+         assert max_seq_lens is not None
+         logits = logits.view(-1, logits.size(-1))
+ 
+-    if args.rollout_temperature != 1.0:
+-        logits = logits.div(args.rollout_temperature)
++    rollout_temperature = float(args.rollout_temperature)
++    # Greedy rollout uses temperature 0. Log-prob evaluation should keep raw logits.
++    if rollout_temperature > 0.0 and rollout_temperature != 1.0:
++        logits = logits.div(rollout_temperature)
+ 
+     cp_size = mpu.get_context_parallel_world_size()
+     end = 0
+diff --git a/slime/ray/rollout.py b/slime/ray/rollout.py
+index 8f919c11..c052ca89 100644
+--- a/slime/ray/rollout.py
++++ b/slime/ray/rollout.py
+@@ -13,7 +13,7 @@ import ray
+ import torch
+ import yaml
+ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+-from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
++from sglang.srt import constants as sglang_constants
+ 
+ from slime.backends.sglang_utils.sglang_engine import SGLangEngine
+ from slime.rollout.base_types import call_rollout_fn
+@@ -35,6 +35,16 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
+ logger = logging.getLogger(__name__)
+ 
+ 
++GPU_MEMORY_TYPE_KV_CACHE = sglang_constants.GPU_MEMORY_TYPE_KV_CACHE
++GPU_MEMORY_TYPE_WEIGHTS = sglang_constants.GPU_MEMORY_TYPE_WEIGHTS
++GPU_MEMORY_TYPE_CUDA_GRAPH = getattr(sglang_constants, "GPU_MEMORY_TYPE_CUDA_GRAPH", None)
++
++
++def _build_resume_memory_tags(*tags: str | None) -> list[str] | None:
++    resolved_tags = [tag for tag in tags if tag is not None]
++    return resolved_tags or None
++
++
+ @dataclasses.dataclass
+ class EngineGroupConfig:
+     """Configuration for a single engine group.
+@@ -578,10 +588,10 @@ class RolloutManager:
+             srv.onload(tags)
+ 
+     def onload_weights(self):
+-        self.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS])
++        self.onload(tags=_build_resume_memory_tags(GPU_MEMORY_TYPE_WEIGHTS))
+ 
+     def onload_kv(self):
+-        self.onload(tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH])
++        self.onload(tags=_build_resume_memory_tags(GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH))
+ 
+     def recover_rollout_engines(self, model_name: str | None = None):
+         """Restart any dead rollout engines and update num_new_engines for update_weights detection."""
+@@ -790,6 +800,8 @@ class RolloutManager:
+ 
+         if samples[0].train_metadata is not None:
+             train_data["metadata"] = [sample.train_metadata for sample in samples]
++        elif self.args.forward_sample_metadata_to_train:
++            train_data["metadata"] = [sample.metadata for sample in samples]
+ 
+         if any(sample.multimodal_train_inputs is not None for sample in samples):
+             train_data["multimodal_train_inputs"] = [sample.multimodal_train_inputs for sample in samples]
+@@ -836,6 +848,7 @@ class RolloutManager:
+                 "rollout_routed_experts",
+                 "prompt",
+                 "teacher_log_probs",
++                "metadata",
+             ]:
+                 if key not in data:
+                     continue
+@@ -849,6 +862,8 @@ class RolloutManager:
+                 if key not in data:
+                     continue
+                 rollout_data[key] = data[key]
++            if "raw_reward" in data:
++                rollout_data["local_raw_reward"] = [data["raw_reward"][j] for j in partition]
+             # Pass dynamic global_batch_size to training side
+             if hasattr(self, "_dynamic_global_batch_size"):
+                 rollout_data["dynamic_global_batch_size"] = self._dynamic_global_batch_size
+@@ -988,11 +1003,16 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool
+         router_args.sglang_router_port = router_port
+ 
+     else:
++        import copy
++
+         from sglang_router.launch_router import RouterArgs
+ 
+         from slime.utils.http_utils import run_router
+ 
+-        router_args = RouterArgs.from_cli_args(args, use_router_prefix=True)
++        router_cli_args = copy.copy(args)
++        router_cli_args.host = getattr(router_cli_args, "host", router_ip)
++        router_cli_args.port = getattr(router_cli_args, "port", router_port)
++        router_args = RouterArgs.from_cli_args(router_cli_args, use_router_prefix=True)
+         router_args.host = router_ip
+         router_args.port = router_port
+         router_args.prometheus_port = find_available_port(random.randint(4000, 5000))
+diff --git a/slime/rollout/rm_hub/deepscaler.py b/slime/rollout/rm_hub/deepscaler.py
+index 39d4de38..e1b96f2e 100644
+--- a/slime/rollout/rm_hub/deepscaler.py
++++ b/slime/rollout/rm_hub/deepscaler.py
+@@ -1,17 +1,31 @@
+ from .math_utils import extract_answer, grade_answer_mathd, grade_answer_sympy
+ 
+ 
+-def get_deepscaler_rule_based_reward(response, label):
++def _get_candidate_solution_segments(response):
++    candidates = []
++
+     if "</think>" in response:
+-        model_solution = response.split("</think>")[-1]
+-    elif "###Response" in response:
+-        model_solution = response.split("###Response")[1]
+-    else:
+-        return 0
++        candidates.append(response.split("</think>")[-1])
++    if "###Response" in response:
++        candidates.append(response.split("###Response", 1)[1])
+ 
+-    model_answer = extract_answer(model_solution)
+-    if model_answer is None:
+-        return 0
++    # Fall back to the full response so base models trained without
++    # explicit reasoning tags can still be rewarded.
++    candidates.append(response)
++
++    deduped_candidates = []
++    seen = set()
++    for candidate in candidates:
++        normalized = candidate.strip()
++        if not normalized or normalized in seen:
++            continue
++        seen.add(normalized)
++        deduped_candidates.append(normalized)
++
++    return deduped_candidates
++
++
++def get_deepscaler_rule_based_reward(response, label):
+     if label == "":
+         return 0
+ 
+@@ -33,10 +47,17 @@ def get_deepscaler_rule_based_reward(response, label):
+     if not processed_ground_truths:
+         return 0
+ 
+-    # Check against all possible correct answers
+-    for ground_truth in processed_ground_truths:
+-        is_correct = grade_answer_mathd(model_answer, ground_truth) or grade_answer_sympy(model_answer, ground_truth)
+-        if is_correct:
+-            return 1
++    for model_solution in _get_candidate_solution_segments(response):
++        model_answer = extract_answer(model_solution)
++        if model_answer is None:
++            continue
++
++        # Check against all possible correct answers
++        for ground_truth in processed_ground_truths:
++            is_correct = grade_answer_mathd(model_answer, ground_truth) or grade_answer_sympy(
++                model_answer, ground_truth
++            )
++            if is_correct:
++                return 1
+ 
+     return 0
+diff --git a/slime/rollout/rm_hub/math_utils.py b/slime/rollout/rm_hub/math_utils.py
+index fe4a8009..6b39e643 100644
+--- a/slime/rollout/rm_hub/math_utils.py
++++ b/slime/rollout/rm_hub/math_utils.py
+@@ -476,6 +476,23 @@ def grade_answer_mathd(given_answer: str, ground_truth: str) -> bool:
+ 
+ 
+ def extract_answer(passage: str) -> str:
++    answer_matches = re.findall(r"<answer>\s*(.*?)\s*</answer>", passage, flags=re.DOTALL)
++    if answer_matches:
++        candidate = answer_matches[-1].strip()
++        candidate = re.sub(r"^\s*Answer\s*:\s*", "", candidate, flags=re.IGNORECASE)
++        if not candidate:
++            return None
++        if "\\boxed" in candidate:
++            return extract_boxed_answer(candidate)
++        return candidate
++    answer_line_matches = re.findall(r"Answer\s*:\s*(.+)", passage, flags=re.IGNORECASE)
++    if answer_line_matches:
++        candidate = answer_line_matches[-1].strip()
++        if not candidate:
++            return None
++        if "\\boxed" in candidate:
++            return extract_boxed_answer(candidate)
++        return candidate
+     if "\\boxed" in passage:
+         return extract_boxed_answer(passage)
+     return None
+diff --git a/slime/rollout/sft_rollout.py b/slime/rollout/sft_rollout.py
+index 6b914a96..67d33e38 100644
+--- a/slime/rollout/sft_rollout.py
++++ b/slime/rollout/sft_rollout.py
+@@ -48,6 +48,12 @@ def generate_rollout(args, rollout_id, data_buffer, evaluation=False):
+ 
+         token_ids, loss_mask = MASK_GENERATOR.get_loss_mask(messages, tools=tools)
+ 
++        max_len = getattr(args, "rollout_max_context_len", None)
++        if max_len is not None and len(token_ids) > max_len:
++            logger.warning(f"sft_rollout: truncating sequence from {len(token_ids)} to {max_len} tokens")
++            token_ids = token_ids[:max_len]
++            loss_mask = loss_mask[:max_len]
++
+         response_length = MASK_GENERATOR.get_response_lengths([loss_mask])[0]
+ 
+         sample.tokens = token_ids
+diff --git a/slime/utils/arguments.py b/slime/utils/arguments.py
+index fb2d305a..f750bdf8 100644
+--- a/slime/utils/arguments.py
++++ b/slime/utils/arguments.py
+@@ -1251,6 +1251,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
+                     "The function should have the signature `def convert_samples_to_train_data(args, samples) -> dict`."
+                 ),
+             )
++            parser.add_argument(
++                "--forward-sample-metadata-to-train",
++                action="store_true",
++                default=False,
++                help="Forward sample.metadata to actor-side rollout_data when train_metadata is not set.",
++            )
+             return parser
+ 
+         def add_rollout_buffer_arguments(parser):
+@@ -1347,6 +1353,65 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
+                 type=str,
+                 default=None,
+             )
++            parser.add_argument(
++                "--custom-online-reward-path",
++                type=str,
++                default=None,
++                help=(
++                    "Path to a custom actor-side online reward function. "
++                    "The function should have the signature "
++                    "`def recompute_rewards(args, model, rollout_data, tokenizer) -> None`."
++                ),
++            )
++            parser.add_argument(
++                "--gar-ground-truth-key",
++                type=str,
++                default="gt_response",
++                help="Metadata key containing the primary/high-confidence anchor text for GAR.",
++            )
++            parser.add_argument(
++                "--gar-aux-ground-truth-key",
++                type=str,
++                default="gar_aux_responses",
++                help="Metadata key containing auxiliary teacher-rolled anchors for GAR.",
++            )
++            parser.add_argument(
++                "--gar-anchor-aggregation",
++                type=str,
++                default="aux_residual",
++                choices=["real_only", "aux_max", "aux_residual"],
++                help="How to combine primary anchors and auxiliary anchors in GAR.",
++            )
++            parser.add_argument(
++                "--gar-aux-weight",
++                type=float,
++                default=0.5,
++                help="Weight applied to auxiliary anchors when primary anchors are present.",
++            )
++            parser.add_argument(
++                "--gar-max-anchors-per-type",
++                type=int,
++                default=0,
++                help="Optional cap for the number of primary or auxiliary anchors used per sample. 0 means no limit.",
++            )
++            parser.add_argument(
++                "--gar-base-reward",
++                type=float,
++                default=1.0,
++                help="Base reward assigned after the verifier gate passes in GAR.",
++            )
++            parser.add_argument(
++                "--gar-beta",
++                type=float,
++                default=0.5,
++                help="Scale for the positive cosine-similarity bonus in GAR.",
++            )
++            parser.add_argument(
++                "--gar-max-response-tokens",
++                type=int,
++                default=0,
++                help="Optional suffix length used for GAR gradient computation. 0 means full response.",
++            )
+             return parser
+ 
+         def add_mtp_training_arguments(parser):
+diff --git a/slime/utils/data.py b/slime/utils/data.py
+index c3dbfa96..61d2d806 100644
+--- a/slime/utils/data.py
++++ b/slime/utils/data.py
+@@ -202,7 +202,7 @@ class Dataset:
+ 
+             metadata = data.get(metadata_key) or {}
+             tools = None
+-            if tool_key is not None and tool_key in data:
++            if tool_key is not None and tool_key in data and data[tool_key] is not None:
+                 tools = data[tool_key]
+                 if isinstance(tools, str):
+                     tools = json.loads(tools)
+diff --git a/slime/utils/logging_utils.py b/slime/utils/logging_utils.py
+index 5fc0fad3..b17d4172 100644
+--- a/slime/utils/logging_utils.py
++++ b/slime/utils/logging_utils.py
+@@ -1,8 +1,5 @@
+ import logging
+ 
+-import wandb
+-
+-from . import wandb_utils
+ from .tensorboard_utils import _TensorboardAdapter
+ 
+ _LOGGER_CONFIGURED = False
+@@ -25,6 +22,12 @@ def configure_logger(prefix: str = ""):
+ 
+ 
+ def init_tracking(args, primary: bool = True, **kwargs):
++    if not args.use_wandb:
++        args.wandb_run_id = None
++        return
++
++    from . import wandb_utils
++
+     if primary:
+         wandb_utils.init_wandb_primary(args, **kwargs)
+     else:
+@@ -34,6 +37,8 @@ def init_tracking(args, primary: bool = True, **kwargs):
+ # TODO further refactor, e.g. put TensorBoard init to the "init" part
+ def log(args, metrics, step_key: str):
+     if args.use_wandb:
++        import wandb
++
+         wandb.log(metrics)
+ 
+     if args.use_tensorboard:
+diff --git a/slime_plugins/gar/__init__.py b/slime_plugins/gar/__init__.py
+new file mode 100644
+index 00000000..589cf23f
+--- /dev/null
++++ b/slime_plugins/gar/__init__.py
+@@ -0,0 +1,3 @@
++from .online_reward import apply_online_gar
++
++__all__ = ["apply_online_gar"]
+diff --git a/slime_plugins/gar/online_reward.py b/slime_plugins/gar/online_reward.py
+new file mode 100644
+index 00000000..42a25b66
+--- /dev/null
++++ b/slime_plugins/gar/online_reward.py
+@@ -0,0 +1,534 @@
++from collections.abc import Sequence
++
++import torch
++import torch.distributed as dist
++import torch.nn.functional as F
++from megatron.core import mpu
++from megatron.core.packed_seq_params import PackedSeqParams
++
++DEFAULT_DATA_PAD_SIZE_MULTIPLIER = 128
++
++
++DEFAULT_GROUND_TRUTH_KEYS = (
++    "gt_response",
++    "gt_cot",
++    "gt_solution",
++    "solution",
++)
++
++DEFAULT_AUX_KEYS = (
++    "gar_aux_responses",
++    "teacher_roll_responses",
++    "teacher_anchors",
++)
++
++
++def _get_last_model_chunk(model_chunks: Sequence):
++    assert len(model_chunks) == 1, "GAR online reward currently supports a single Megatron model chunk only."
++    model_chunk = model_chunks[-1]
++    assert hasattr(model_chunk, "module"), "Expected Megatron DDP wrapper with a `.module` attribute."
++    return model_chunk
++
++
++def _get_unwrapped_model_module(model_chunk):
++    model_module = model_chunk.module
++    while hasattr(model_module, "module"):
++        model_module = model_module.module
++    return model_module
++
++
++def _get_output_layer_kwargs(model_module):
++    output_weight = None
++    if getattr(model_module, "share_embeddings_and_output_weights", False):
++        output_weight = model_module.shared_embedding_or_output_weight().detach()
++    return {
++        "weight": output_weight,
++        "runtime_gather_output": None,
++    }
++
++
++def _get_data_pad_size(args) -> int:
++    pad_multiplier = int(getattr(args, "data_pad_size_multiplier", DEFAULT_DATA_PAD_SIZE_MULTIPLIER))
++    assert pad_multiplier > 0, f"Invalid data_pad_size_multiplier={pad_multiplier}."
++    return mpu.get_tensor_model_parallel_world_size() * pad_multiplier
++
++
++def _compute_single_sample_pad(total_length: int, pad_size: int) -> int:
++    assert total_length > 0, f"Invalid total_length={total_length}."
++    assert pad_size > 0, f"Invalid pad_size={pad_size}."
++    return (pad_size - total_length % pad_size) % pad_size
++
++
++def _compute_response_spans(
++    total_length: int,
++    response_length: int,
++    max_response_tokens: int,
++) -> tuple[int, int, int, int]:
++    assert total_length > 0, f"Invalid total_length={total_length}."
++    assert 0 < response_length < total_length, f"Invalid response_length={response_length} for total_length={total_length}."
++
++    effective_response_length = _get_effective_response_length(response_length, max_response_tokens)
++
++    hidden_end = total_length - 1
++    hidden_start = hidden_end - effective_response_length
++    token_end = total_length
++    token_start = token_end - effective_response_length
++    return hidden_start, hidden_end, token_start, token_end
++
++
++def _get_effective_response_length(response_length: int, max_response_tokens: int) -> int:
++    assert response_length > 0, f"Invalid response_length={response_length}."
++    if max_response_tokens <= 0:
++        return response_length
++    return min(response_length, max_response_tokens)
++
++
++def _compute_sequence_shard_bounds(
++    padded_length: int,
++    tp_rank: int,
++    tp_size: int,
++) -> tuple[int, int]:
++    assert padded_length > 0, f"Invalid padded_length={padded_length}."
++    assert tp_size > 0, f"Invalid tp_size={tp_size}."
++    assert 0 <= tp_rank < tp_size, f"Invalid tp_rank={tp_rank} for tp_size={tp_size}."
++    assert padded_length % tp_size == 0, f"{padded_length} must be divisible by tp_size={tp_size}."
++
++    shard_size = padded_length // tp_size
++    shard_start = shard_size * tp_rank
++    shard_end = shard_start + shard_size
++    return shard_start, shard_end
++
++
++def _compute_local_response_spans(
++    hidden_start: int,
++    hidden_end: int,
++    shard_start: int,
++    shard_end: int,
++) -> tuple[int, int, int, int] | None:
++    local_hidden_start = max(hidden_start, shard_start)
++    local_hidden_end = min(hidden_end, shard_end)
++    if local_hidden_start >= local_hidden_end:
++        return None
++
++    local_token_start = local_hidden_start + 1
++    local_token_end = local_hidden_end + 1
++    return (
++        local_hidden_start - shard_start,
++        local_hidden_end - shard_start,
++        local_token_start,
++        local_token_end,
++    )
++
++
++def _gather_hidden_states_across_tp(hidden_states: torch.Tensor, padded_length: int) -> torch.Tensor:
++    tp_size = mpu.get_tensor_model_parallel_world_size()
++    if tp_size <= 1 or hidden_states.size(0) == padded_length:
++        return hidden_states
++
++    tp_rank = mpu.get_tensor_model_parallel_rank()
++    shard_start, shard_end = _compute_sequence_shard_bounds(padded_length, tp_rank, tp_size)
++    expected_shard_length = shard_end - shard_start
++    assert hidden_states.size(0) == expected_shard_length, f"{hidden_states.size(0)} vs {expected_shard_length}"
++
++    gathered_hidden_states = [torch.empty_like(hidden_states) for _ in range(tp_size)]
++    dist.all_gather(gathered_hidden_states, hidden_states.contiguous(), group=mpu.get_tensor_model_parallel_group())
++    full_hidden_states = torch.cat(gathered_hidden_states, dim=0)
++    assert full_hidden_states.size(0) == padded_length, f"{full_hidden_states.size(0)} vs {padded_length}"
++    return full_hidden_states
++
++
++def _make_single_sample_inputs(args, full_tokens: torch.Tensor):
++    total_length = int(full_tokens.size(0))
++    pad = _compute_single_sample_pad(total_length, _get_data_pad_size(args))
++    padded_tokens = full_tokens
++    cu_seqlens_list = [0, total_length]
++    if pad != 0:
++        padded_tokens = F.pad(padded_tokens, (0, pad), value=0)
++        cu_seqlens_list.append(total_length + pad)
++
++    tokens = padded_tokens.unsqueeze(0)
++    loss_mask = torch.ones_like(tokens, dtype=torch.int)
++    cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int, device=full_tokens.device)
++    max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
++    packed_seq_params = PackedSeqParams(
++        cu_seqlens_q=cu_seqlens,
++        cu_seqlens_kv=cu_seqlens,
++        max_seqlen_q=max_seqlen,
++        max_seqlen_kv=max_seqlen,
++        qkv_format="thd",
++    )
++    return tokens, loss_mask, packed_seq_params, int(padded_tokens.size(0))
++
++
++def _normalize_anchor_value(value) -> list[str]:
++    anchors = []
++    if isinstance(value, str):
++        if value.strip():
++            anchors.append(value)
++        return anchors
++
++    if isinstance(value, (list, tuple)):
++        for item in value:
++            if isinstance(item, str) and item.strip():
++                anchors.append(item)
++        return anchors
++
++    return anchors
++
++
++def _deduplicate_anchors(anchors: list[str], max_count: int) -> list[str]:
++    seen = set()
++    deduplicated = []
++    for anchor in anchors:
++        normalized = " ".join(anchor.split())
++        if normalized in seen:
++            continue
++        seen.add(normalized)
++        deduplicated.append(anchor)
++        if max_count > 0 and len(deduplicated) >= max_count:
++            break
++    return deduplicated
++
++
++def _get_primary_anchor_texts(args, metadata: dict) -> list[str]:
++    candidate_keys = [args.gar_ground_truth_key]
++    candidate_keys.extend([key for key in DEFAULT_GROUND_TRUTH_KEYS if key != args.gar_ground_truth_key])
++
++    anchors = []
++    for key in candidate_keys:
++        anchors.extend(_normalize_anchor_value(metadata.get(key)))
++
++    return _deduplicate_anchors(anchors, args.gar_max_anchors_per_type)
++
++
++def _get_aux_anchor_texts(args, metadata: dict) -> list[str]:
++    candidate_keys = [args.gar_aux_ground_truth_key]
++    candidate_keys.extend([key for key in DEFAULT_AUX_KEYS if key != args.gar_aux_ground_truth_key])
++
++    anchors = []
++    for key in candidate_keys:
++        anchors.extend(_normalize_anchor_value(metadata.get(key)))
++
++    return _deduplicate_anchors(anchors, args.gar_max_anchors_per_type)
++
++
++def _slice_response_hidden_and_targets(
++    hidden_states: torch.Tensor,
++    full_tokens: torch.Tensor,
++    padded_length: int,
++    response_length: int,
++    max_response_tokens: int,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    # Match the response alignment used by Megatron policy log-prob computation:
++    # hidden[start - 1 : end - 1] predicts tokens[start : end].
++    assert hidden_states.dim() == 3 and hidden_states.size(1) == 1, f"Unexpected hidden shape: {hidden_states.shape}"
++
++    hidden_start, hidden_end, _, _ = _compute_response_spans(
++        int(full_tokens.size(0)),
++        response_length,
++        max_response_tokens,
++    )
++
++    tp_size = mpu.get_tensor_model_parallel_world_size()
++    tp_rank = mpu.get_tensor_model_parallel_rank()
++    shard_start = 0
++    shard_end = padded_length
++    if hidden_states.size(0) != padded_length:
++        shard_start, shard_end = _compute_sequence_shard_bounds(padded_length, tp_rank, tp_size)
++        assert hidden_states.size(0) == shard_end - shard_start, f"{hidden_states.size(0)} vs {shard_end - shard_start}"
++
++    local_spans = _compute_local_response_spans(hidden_start, hidden_end, shard_start, shard_end)
++    if local_spans is None:
++        empty_hidden = hidden_states[:0]
++        empty_tokens = full_tokens[:0]
++        return empty_hidden, empty_tokens
++
++    local_hidden_start, local_hidden_end, local_token_start, local_token_end = local_spans
++    response_hidden = hidden_states[local_hidden_start:local_hidden_end]
++    response_tokens = full_tokens[local_token_start:local_token_end]
++    assert response_hidden.size(0) == response_tokens.size(0), f"{response_hidden.size(0)} vs {response_tokens.size(0)}"
++    return response_hidden, response_tokens
++
++
++def _capture_last_hidden(args, model_chunks: Sequence, full_tokens: torch.Tensor) -> tuple[torch.Tensor, int]:
++    model_chunk = _get_last_model_chunk(model_chunks)
++    model_module = _get_unwrapped_model_module(model_chunk)
++    assert hasattr(model_module, "output_layer"), "GAR online reward requires `output_layer` on the model module."
++
++    captured_hidden = []
++
++    def _hook(_, hook_input):
++        hidden_states = hook_input[0]
++        captured_hidden.append(hidden_states.detach())
++
++    hook_handle = model_module.output_layer.register_forward_pre_hook(_hook)
++
++    original_modes = [chunk.training for chunk in model_chunks]
++    for chunk in model_chunks:
++        chunk.eval()
++
++    tokens, loss_mask, packed_seq_params, padded_length = _make_single_sample_inputs(args, full_tokens)
++    with torch.no_grad():
++        _ = model_chunk(
++            input_ids=tokens,
++            position_ids=None,
++            attention_mask=None,
++            labels=None,
++            packed_seq_params=packed_seq_params,
++            loss_mask=loss_mask,
++        )
++
++    hook_handle.remove()
++
++    for chunk, mode in zip(model_chunks, original_modes, strict=False):
++        chunk.train(mode)
++
++    assert len(captured_hidden) == 1, f"Expected one hidden capture, got {len(captured_hidden)}."
++    return captured_hidden[0], padded_length
++
++
++def _compute_gradient_vector(
++    args,
++    model_chunks: Sequence,
++    full_tokens: torch.Tensor,
++    response_length: int,
++) -> torch.Tensor:
++    hidden_states, padded_length = _capture_last_hidden(args, model_chunks, full_tokens)
++    model_chunk = _get_last_model_chunk(model_chunks)
++    model_module = _get_unwrapped_model_module(model_chunk)
++    output_layer = model_module.output_layer
++    is_sequence_parallel = bool(getattr(output_layer, "sequence_parallel", False))
++    tp_size = mpu.get_tensor_model_parallel_world_size()
++
++    hidden_states_for_loss = hidden_states
++    if is_sequence_parallel and tp_size > 1:
++        hidden_states_for_loss = _gather_hidden_states_across_tp(hidden_states, padded_length)
++
++    response_hidden, response_tokens = _slice_response_hidden_and_targets(
++        hidden_states_for_loss,
++        full_tokens,
++        padded_length,
++        response_length,
++        args.gar_max_response_tokens,
++    )
++
++    hidden_size = int(hidden_states.size(-1))
++    response_token_count = int(response_tokens.size(0))
++    effective_response_length = _get_effective_response_length(response_length, args.gar_max_response_tokens)
++    if response_token_count == 0:
++        grad_sum = torch.zeros(hidden_size, device=hidden_states.device, dtype=hidden_states.dtype)
++    else:
++        hidden_leaf = response_hidden.detach().requires_grad_(True)
++        if is_sequence_parallel and tp_size > 1:
++            output_weight = _get_output_layer_kwargs(model_module)["weight"]
++            if output_weight is None:
++                output_weight = output_layer.weight.detach()
++            output_bias = output_layer.bias.detach() if output_layer.bias is not None else None
++            local_logits = F.linear(hidden_leaf, output_weight, output_bias)
++            per_token_loss = model_module.compute_language_model_loss(
++                response_tokens.unsqueeze(0),
++                local_logits,
++            )
++        else:
++            output_kwargs = _get_output_layer_kwargs(model_module)
++            per_token_loss = model_module.compute_output_layer_and_language_model_loss(
++                hidden_leaf,
++                labels=response_tokens.unsqueeze(0),
++                weight=output_kwargs["weight"],
++                sequence_parallel_enabled=is_sequence_parallel,
++                column_parallel_linear=output_layer,
++                col_linear_kwargs=output_kwargs,
++                reduction="none",
++            )
++        loss = per_token_loss.sum() / effective_response_length
++        grad_hidden = torch.autograd.grad(loss, hidden_leaf, retain_graph=False, create_graph=False)[0]
++        grad_sum = grad_hidden.sum(dim=(0, 1)).detach()
++
++    if is_sequence_parallel and tp_size > 1:
++        dist.all_reduce(grad_sum, group=mpu.get_tensor_model_parallel_group())
++
++    return (grad_sum / effective_response_length).detach()
++
++
++def _get_anchor_cache_key(
++    args,
++    prompt_tokens: torch.Tensor,
++    anchor_text: str,
++):
++    return (tuple(prompt_tokens.tolist()), anchor_text, args.gar_max_response_tokens)
++
++
++def _build_anchor_gradient(
++    args,
++    model,
++    prompt_tokens: torch.Tensor,
++    anchor_text: str,
++    tokenizer,
++) -> torch.Tensor:
++    anchor_tokens = tokenizer.encode(anchor_text, add_special_tokens=False)
++    assert anchor_tokens, "GAR anchor tokenization produced an empty sequence."
++
++    full_tokens = torch.cat(
++        [
++            prompt_tokens,
++            torch.tensor(anchor_tokens, dtype=torch.long, device=prompt_tokens.device),
++        ],
++        dim=0,
++    )
++    gradient = _compute_gradient_vector(
++        args,
++        model,
++        full_tokens,
++        len(anchor_tokens),
++    )
++    return gradient
++
++
++def _get_best_cosine(
++    args,
++    model,
++    prompt_tokens: torch.Tensor,
++    anchor_texts: list[str],
++    pred_gradient: torch.Tensor,
++    tokenizer,
++    gt_cache: dict,
++) -> float | None:
++    best_cosine = None
++    for anchor_text in anchor_texts:
++        cache_key = _get_anchor_cache_key(args, prompt_tokens, anchor_text)
++        if cache_key not in gt_cache:
++            gt_cache[cache_key] = _build_anchor_gradient(
++                args,
++                model,
++                prompt_tokens,
++                anchor_text,
++                tokenizer,
++            )
++
++        cosine = F.cosine_similarity(pred_gradient.unsqueeze(0), gt_cache[cache_key].unsqueeze(0), dim=-1).item()
++        cosine = max(0.0, cosine)
++        best_cosine = cosine if best_cosine is None else max(best_cosine, cosine)
++
++    return best_cosine
++
++
++def _aggregate_bonus(args, real_best: float | None, aux_best: float | None) -> float:
++    if real_best is None:
++        assert aux_best is not None
++        return aux_best
++
++    if aux_best is None or args.gar_anchor_aggregation == "real_only":
++        return real_best
++
++    if args.gar_anchor_aggregation == "aux_max":
++        return max(real_best, args.gar_aux_weight * aux_best)
++
++    if args.gar_anchor_aggregation == "aux_residual":
++        return real_best + args.gar_aux_weight * max(0.0, aux_best - real_best)
++
++    raise AssertionError(f"Unsupported GAR anchor aggregation: {args.gar_anchor_aggregation}")
++
++
++def apply_online_gar(args, model, rollout_data, tokenizer) -> None:
++    if not mpu.is_pipeline_last_stage():
++        return
++
++    print("Starting GAR online reward recomputation")
++    assert args.qkv_format == "thd", f"GAR online reward only supports qkv_format='thd', got {args.qkv_format}."
++    assert mpu.get_context_parallel_world_size() == 1, "GAR online reward currently supports context parallel size 1."
++    assert "metadata" in rollout_data, "GAR online reward requires metadata in rollout_data."
++
++    tokens_list = rollout_data["tokens"]
++    response_lengths = rollout_data["response_lengths"]
++    total_lengths = rollout_data["total_lengths"]
++    raw_rewards = rollout_data.get("local_raw_reward", rollout_data["raw_reward"])
++    metadata_list = rollout_data["metadata"]
++
++    assert len(tokens_list) == len(response_lengths) == len(total_lengths) == len(raw_rewards) == len(metadata_list)
++
++    new_rewards = []
++    real_cosine_values = []
++    aux_cosine_values = []
++    num_aux_only = 0
++    gt_cache = {}
++
++    for tokens, response_length, total_length, raw_reward, metadata in zip(
++        tokens_list,
++        response_lengths,
++        total_lengths,
++        raw_rewards,
++        metadata_list,
++        strict=False,
++    ):
++        gate = float(raw_reward)
++        if gate <= 0:
++            new_rewards.append(0.0)
++            continue
++
++        assert isinstance(metadata, dict), f"GAR metadata must be a dict, got {type(metadata)}."
++
++        total_length = int(total_length)
++        response_length = int(response_length)
++        prompt_length = total_length - response_length
++        assert prompt_length > 0, f"Invalid prompt_length={prompt_length} for total={total_length}, response={response_length}."
++
++        full_tokens = tokens[:total_length]
++        prompt_tokens = full_tokens[:prompt_length]
++
++        primary_anchor_texts = _get_primary_anchor_texts(args, metadata)
++        auxiliary_anchor_texts = _get_aux_anchor_texts(args, metadata)
++        assert primary_anchor_texts or auxiliary_anchor_texts, (
++            "GAR requires at least one primary or auxiliary anchor in metadata. "
++            f"Available keys: {sorted(metadata.keys())}"
++        )
++
++        pred_gradient = _compute_gradient_vector(
++            args,
++            model,
++            full_tokens,
++            response_length,
++        )
++
++        real_best = _get_best_cosine(
++            args,
++            model,
++            prompt_tokens,
++            primary_anchor_texts,
++            pred_gradient,
++            tokenizer,
++            gt_cache,
++        )
++        aux_best = _get_best_cosine(
++            args,
++            model,
++            prompt_tokens,
++            auxiliary_anchor_texts,
++            pred_gradient,
++            tokenizer,
++            gt_cache,
++        )
++
++        if real_best is not None:
++            real_cosine_values.append(real_best)
++        if aux_best is not None:
++            aux_cosine_values.append(aux_best)
++        if real_best is None and aux_best is not None:
++            num_aux_only += 1
++
++        bonus = _aggregate_bonus(args, real_best, aux_best)
++        new_rewards.append(args.gar_base_reward + args.gar_beta * max(0.0, bonus))
++
++    rollout_data["rewards"] = new_rewards
++
++    if real_cosine_values or aux_cosine_values:
++        mean_real_cosine = sum(real_cosine_values) / len(real_cosine_values) if real_cosine_values else 0.0
++        mean_aux_cosine = sum(aux_cosine_values) / len(aux_cosine_values) if aux_cosine_values else 0.0
++        mean_reward = sum(new_rewards) / len(new_rewards)
++        print(
++            f"Finished GAR online reward recomputation: "
++            f"num_real={len(real_cosine_values)}, num_aux={len(aux_cosine_values)}, "
++            f"num_aux_only={num_aux_only}, mean_real_cosine={mean_real_cosine:.4f}, "
++            f"mean_aux_cosine={mean_aux_cosine:.4f}, mean_reward={mean_reward:.4f}"
++        )
++    else:
++        print("Finished GAR online reward recomputation: no verifier-passing samples in this rollout")
+diff --git a/tests/test_deepscaler_reward.py b/tests/test_deepscaler_reward.py
+new file mode 100644
+index 00000000..010b5f42
+--- /dev/null
++++ b/tests/test_deepscaler_reward.py
+@@ -0,0 +1,36 @@
++from slime.rollout.rm_hub.deepscaler import get_deepscaler_rule_based_reward
++
++
++def test_deepscaler_supports_think_format():
++    response = "<think>Compute carefully.</think><answer>42</answer>"
++    assert get_deepscaler_rule_based_reward(response, "42") == 1
++
++
++def test_deepscaler_supports_response_header_format():
++    response = "###Response\nAnswer: \\boxed{42}"
++    assert get_deepscaler_rule_based_reward(response, "42") == 1
++
++
++def test_deepscaler_supports_plain_base_model_format():
++    response = "We solve it directly.\n<answer>42</answer>"
++    assert get_deepscaler_rule_based_reward(response, "42") == 1
++
++
++def test_deepscaler_supports_answer_tag_with_boxed_content():
++    response = "<think>Compute carefully.</think><answer>\\boxed{42}</answer>"
++    assert get_deepscaler_rule_based_reward(response, "42") == 1
++
++
++def test_deepscaler_supports_answer_tag_with_answer_prefix():
++    response = "<think>Compute carefully.</think><answer>Answer: \\boxed{42}</answer>"
++    assert get_deepscaler_rule_based_reward(response, "42") == 1
++
++
++def test_deepscaler_supports_plain_answer_prefix_without_tags():
++    response = "We solve it directly.\nAnswer: 42"
++    assert get_deepscaler_rule_based_reward(response, "42") == 1
++
++
++def test_deepscaler_rejects_wrong_answer():
++    response = "We solve it directly.\n<answer>41</answer>"
++    assert get_deepscaler_rule_based_reward(response, "42") == 0
+diff --git a/tests/test_gar_online_reward.py b/tests/test_gar_online_reward.py
+new file mode 100644
+index 00000000..3ac68dee
+--- /dev/null
++++ b/tests/test_gar_online_reward.py
+@@ -0,0 +1,105 @@
++import torch
++
++from slime_plugins.gar.online_reward import (
++    _compute_local_response_spans,
++    _compute_response_spans,
++    _compute_sequence_shard_bounds,
++    _compute_single_sample_pad,
++    _gather_hidden_states_across_tp,
++    _get_effective_response_length,
++    _get_unwrapped_model_module,
++    _slice_response_hidden_and_targets,
++)
++
++
++class _LeafModule(torch.nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.output_layer = torch.nn.Linear(4, 4, bias=False)
++
++
++class _WrapperModule(torch.nn.Module):
++    def __init__(self, module):
++        super().__init__()
++        self.module = module
++
++
++def test_get_unwrapped_model_module_unwraps_nested_module_chain():
++    leaf = _LeafModule()
++    chunk = _WrapperModule(_WrapperModule(leaf))
++
++    resolved = _get_unwrapped_model_module(chunk)
++
++    assert resolved is leaf
++    assert hasattr(resolved, "output_layer")
++
++
++def test_compute_single_sample_pad_matches_expected_multiple():
++    assert _compute_single_sample_pad(513, 256) == 255
++    assert _compute_single_sample_pad(512, 256) == 0
++
++
++def test_compute_response_spans_respects_max_response_tokens():
++    hidden_start, hidden_end, token_start, token_end = _compute_response_spans(
++        total_length=20,
++        response_length=8,
++        max_response_tokens=3,
++    )
++
++    assert (hidden_start, hidden_end) == (16, 19)
++    assert (token_start, token_end) == (17, 20)
++    assert _get_effective_response_length(8, 3) == 3
++
++
++def test_compute_local_response_spans_returns_overlap_only():
++    shard_start, shard_end = _compute_sequence_shard_bounds(padded_length=16, tp_rank=1, tp_size=2)
++
++    spans = _compute_local_response_spans(
++        hidden_start=6,
++        hidden_end=11,
++        shard_start=shard_start,
++        shard_end=shard_end,
++    )
++
++    assert spans == (0, 3, 9, 12)
++
++
++def test_slice_response_hidden_and_targets_supports_sequence_parallel_shard(monkeypatch):
++    monkeypatch.setattr("slime_plugins.gar.online_reward.mpu.get_tensor_model_parallel_world_size", lambda: 2)
++    monkeypatch.setattr("slime_plugins.gar.online_reward.mpu.get_tensor_model_parallel_rank", lambda: 1)
++
++    hidden_states = torch.arange(8 * 1 * 4, dtype=torch.float32).reshape(8, 1, 4)
++    full_tokens = torch.arange(12, dtype=torch.long)
++
++    response_hidden, response_tokens = _slice_response_hidden_and_targets(
++        hidden_states=hidden_states,
++        full_tokens=full_tokens,
++        padded_length=16,
++        response_length=5,
++        max_response_tokens=0,
++    )
++
++    assert response_hidden.shape == (3, 1, 4)
++    assert response_tokens.tolist() == [9, 10, 11]
++    assert torch.equal(response_hidden[:, 0, 0], torch.tensor([0.0, 4.0, 8.0]))
++
++
++def test_gather_hidden_states_across_tp_reconstructs_full_sequence(monkeypatch):
++    monkeypatch.setattr("slime_plugins.gar.online_reward.mpu.get_tensor_model_parallel_world_size", lambda: 2)
++    monkeypatch.setattr("slime_plugins.gar.online_reward.mpu.get_tensor_model_parallel_rank", lambda: 1)
++    monkeypatch.setattr("slime_plugins.gar.online_reward.mpu.get_tensor_model_parallel_group", lambda: "tp-group")
++
++    local_hidden = torch.arange(8 * 1 * 4, dtype=torch.float32).reshape(8, 1, 4)
++
++    def _fake_all_gather(output_tensors, input_tensor, group):
++        assert group == "tp-group"
++        output_tensors[0].copy_(torch.full_like(input_tensor, -1.0))
++        output_tensors[1].copy_(input_tensor)
++
++    monkeypatch.setattr("slime_plugins.gar.online_reward.dist.all_gather", _fake_all_gather)
++
++    gathered_hidden = _gather_hidden_states_across_tp(local_hidden, padded_length=16)
++
++    assert gathered_hidden.shape == (16, 1, 4)
++    assert torch.equal(gathered_hidden[:8], torch.full((8, 1, 4), -1.0))
++    assert torch.equal(gathered_hidden[8:], local_hidden)
+diff --git a/tests/test_megatron_loss.py b/tests/test_megatron_loss.py
+new file mode 100644
+index 00000000..1ac5d212
+--- /dev/null
++++ b/tests/test_megatron_loss.py
+@@ -0,0 +1,51 @@
++from argparse import Namespace
++
++import torch
++
++from slime.backends.megatron_utils.loss import get_responses
++
++
++def test_get_responses_keeps_logits_finite_for_greedy_rollout(monkeypatch):
++    monkeypatch.setattr("slime.backends.megatron_utils.loss.mpu.get_context_parallel_world_size", lambda: 1)
++
++    logits = torch.tensor(
++        [[[0.0, 1.0], [2.0, 3.0], [4.0, 5.0], [6.0, 7.0]]],
++        dtype=torch.float32,
++    )
++    args = Namespace(qkv_format="thd", rollout_temperature=0.0)
++
++    logits_chunk, tokens_chunk = next(
++        get_responses(
++            logits,
++            args=args,
++            unconcat_tokens=[torch.tensor([10, 11, 12, 13], dtype=torch.long)],
++            total_lengths=[4],
++            response_lengths=[2],
++        )
++    )
++
++    assert torch.isfinite(logits_chunk).all()
++    assert torch.equal(logits_chunk, torch.tensor([[2.0, 3.0], [4.0, 5.0]], dtype=torch.float32))
++    assert torch.equal(tokens_chunk, torch.tensor([12, 13], dtype=torch.long))
++
++
++def test_get_responses_still_scales_logits_for_positive_temperature(monkeypatch):
++    monkeypatch.setattr("slime.backends.megatron_utils.loss.mpu.get_context_parallel_world_size", lambda: 1)
++
++    logits = torch.tensor(
++        [[[0.0, 2.0], [4.0, 6.0], [8.0, 10.0], [12.0, 14.0]]],
++        dtype=torch.float32,
++    )
++    args = Namespace(qkv_format="thd", rollout_temperature=2.0)
++
++    logits_chunk, _ = next(
++        get_responses(
++            logits,
++            args=args,
++            unconcat_tokens=[torch.tensor([10, 11, 12, 13], dtype=torch.long)],
++            total_lengths=[4],
++            response_lengths=[2],
++        )
++    )
++
++    assert torch.equal(logits_chunk, torch.tensor([[2.0, 3.0], [4.0, 5.0]], dtype=torch.float32))
+diff --git a/tests/test_rollout_compat.py b/tests/test_rollout_compat.py
+new file mode 100644
+index 00000000..09dcde6e
+--- /dev/null
++++ b/tests/test_rollout_compat.py
+@@ -0,0 +1,9 @@
++from slime.ray.rollout import _build_resume_memory_tags
++
++
++def test_build_resume_memory_tags_filters_missing_optional_tags():
++    assert _build_resume_memory_tags("kv_cache", None) == ["kv_cache"]
++
++
++def test_build_resume_memory_tags_returns_none_when_all_tags_missing():
++    assert _build_resume_memory_tags(None) is None
